@@ -59,6 +59,7 @@ DEFAULT_CLASSES = (
 )
 YOLOE_CLASSES = os.environ.get("YOLOE_CLASSES", DEFAULT_CLASSES)
 MODELS_DIR = Path(__file__).parent / "models"
+SCENES_DIR = Path(os.environ.get("SCENES_DIR", Path(__file__).parent / "scenes"))
 AGENT_IDENTITY = "agent"
 
 log = logging.getLogger("live_agent")
@@ -208,10 +209,27 @@ async def watch_track(room: rtc.Room, track: rtc.RemoteVideoTrack, participant: 
             # Inference runs off the event loop so LiveKit keeps flowing.
             event = await asyncio.to_thread(detector.analyze, rgb)
             if event is not None:
+                asyncio.create_task(asyncio.to_thread(save_scene, rgb.copy(), participant.identity, event))
                 asyncio.create_task(send_alert(room, participant.identity, event))
     finally:
         await stream.aclose()
         log.info("stopped watching %s", participant.identity)
+
+
+def save_scene(rgb: np.ndarray, identity: str, event: Event) -> Path:
+    """Write the frame (JPEG) plus detections (JSON) so a VLM can be run on it."""
+    from PIL import Image
+
+    SCENES_DIR.mkdir(parents=True, exist_ok=True)
+    ts_ms = int(time.time() * 1000)
+    stem = SCENES_DIR / f"{ts_ms}_{identity}"
+    image_path = stem.with_suffix(".jpg")
+    Image.fromarray(rgb).save(image_path, quality=90)
+    stem.with_suffix(".json").write_text(
+        json.dumps({**asdict(event), "ts_ms": ts_ms, "identity": identity, "image": image_path.name}, indent=2)
+    )
+    log.info("saved scene %s", image_path)
+    return image_path
 
 
 async def send_alert(room: rtc.Room, identity: str, event: Event) -> None:
