@@ -1,0 +1,6 @@
+livekit>=1.1
+livekit-api>=1.2
+aiohttp>=3.9
+numpy>=2.0
+ultralytics>=8.4
+git+https://github.com/ultralytics/CLIP.git

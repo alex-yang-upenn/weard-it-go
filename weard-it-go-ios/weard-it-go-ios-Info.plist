@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Merged with the keys Xcode generates from INFOPLIST_KEY_* build settings. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>wearditgo</string>
+			</array>
+		</dict>
+	</array>
+	<!-- Meta Wearables Device Access Toolkit. With Developer Mode on in the Meta AI app,
+	     META_APP_ID / CLIENT_TOKEN can stay unset; production needs values from the
+	     Wearables Developer Center. -->
+	<key>MWDAT</key>
+	<dict>
+		<key>AppLinkURLScheme</key>
+		<string>wearditgo://</string>
+		<key>MetaAppID</key>
+		<string>$(META_APP_ID)</string>
+		<key>ClientToken</key>
+		<string>$(CLIENT_TOKEN)</string>
+		<key>TeamID</key>
+		<string>$(DEVELOPMENT_TEAM)</string>
+	</dict>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>processing</string>
+		<string>bluetooth-central</string>
+		<string>bluetooth-peripheral</string>
+		<string>external-accessory</string>
+	</array>
+	<key>UISupportedExternalAccessoryProtocols</key>
+	<array>
+		<string>com.meta.ar.wearable</string>
+	</array>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Needed to connect to Meta AI Glasses</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>This lets your phone find and connect to your glasses over Wi-Fi, and reach a streaming server on your local network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_bonjour._tcp</string>
+	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>Used only in debug builds to feed the phone camera into simulated glasses.</string>
+	<!-- Allow plain ws:// to LAN / .local dev servers; use wss:// for anything public. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+</dict>
+</plist>

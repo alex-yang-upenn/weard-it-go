@@ -6,6 +6,13 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		0A1B2C3D4E5F600000000021 /* MWDATCore in Frameworks */ = {isa = PBXBuildFile; productRef = 0A1B2C3D4E5F600000000011 /* MWDATCore */; };
+		0A1B2C3D4E5F600000000022 /* MWDATCamera in Frameworks */ = {isa = PBXBuildFile; productRef = 0A1B2C3D4E5F600000000012 /* MWDATCamera */; };
+		0A1B2C3D4E5F600000000023 /* MWDATMockDevice in Frameworks */ = {isa = PBXBuildFile; productRef = 0A1B2C3D4E5F600000000013 /* MWDATMockDevice */; };
+		0A1B2C3D4E5F600000000024 /* LiveKit in Frameworks */ = {isa = PBXBuildFile; productRef = 0A1B2C3D4E5F600000000014 /* LiveKit */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		070CEBA63078B22F00B8BABD /* weard-it-go-ios.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "weard-it-go-ios.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -23,6 +30,10 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				0A1B2C3D4E5F600000000021 /* MWDATCore in Frameworks */,
+				0A1B2C3D4E5F600000000022 /* MWDATCamera in Frameworks */,
+				0A1B2C3D4E5F600000000023 /* MWDATMockDevice in Frameworks */,
+				0A1B2C3D4E5F600000000024 /* LiveKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -65,6 +76,10 @@
 			);
 			name = "weard-it-go-ios";
 			packageProductDependencies = (
+				0A1B2C3D4E5F600000000011 /* MWDATCore */,
+				0A1B2C3D4E5F600000000012 /* MWDATCamera */,
+				0A1B2C3D4E5F600000000013 /* MWDATMockDevice */,
+				0A1B2C3D4E5F600000000014 /* LiveKit */,
 			);
 			productName = "weard-it-go-ios";
 			productReference = 070CEBA63078B22F00B8BABD /* weard-it-go-ios.app */;
@@ -94,6 +109,10 @@
 			);
 			mainGroup = 070CEB9D3078B22F00B8BABD;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				0A1B2C3D4E5F600000000001 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */,
+				0A1B2C3D4E5F600000000002 /* XCRemoteSwiftPackageReference "client-sdk-swift" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 070CEBA73078B22F00B8BABD /* Products */;
 			projectDirPath = "";
@@ -254,6 +273,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "weard-it-go-ios-Info.plist";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -274,13 +294,13 @@
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TARGETED_DEVICE_FAMILY = "1,2";
 				XROS_DEPLOYMENT_TARGET = 26.5;
 			};
 			name = Debug;
@@ -298,6 +318,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "weard-it-go-ios-Info.plist";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -318,13 +339,13 @@
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TARGETED_DEVICE_FAMILY = "1,2";
 				XROS_DEPLOYMENT_TARGET = 26.5;
 			};
 			name = Release;
@@ -351,6 +372,48 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		0A1B2C3D4E5F600000000001 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/facebook/meta-wearables-dat-ios";
+			requirement = {
+				kind = upToNextMinorVersion;
+				minimumVersion = 1.0.0;
+			};
+		};
+		0A1B2C3D4E5F600000000002 /* XCRemoteSwiftPackageReference "client-sdk-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/livekit/client-sdk-swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.17.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		0A1B2C3D4E5F600000000011 /* MWDATCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 0A1B2C3D4E5F600000000001 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
+			productName = MWDATCore;
+		};
+		0A1B2C3D4E5F600000000012 /* MWDATCamera */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 0A1B2C3D4E5F600000000001 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
+			productName = MWDATCamera;
+		};
+		0A1B2C3D4E5F600000000013 /* MWDATMockDevice */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 0A1B2C3D4E5F600000000001 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
+			productName = MWDATMockDevice;
+		};
+		0A1B2C3D4E5F600000000014 /* LiveKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 0A1B2C3D4E5F600000000002 /* XCRemoteSwiftPackageReference "client-sdk-swift" */;
+			productName = LiveKit;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 070CEB9E3078B22F00B8BABD /* Project object */;
 }
