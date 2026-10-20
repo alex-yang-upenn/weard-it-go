@@ -1,0 +1,19 @@
+{
+  "title": "Seen: phone",
+  "detail": "phone 56%",
+  "objects": [
+    {
+      "label": "phone",
+      "confidence": 0.56,
+      "box": [
+        0.539,
+        0.455,
+        0.277,
+        0.291
+      ]
+    }
+  ],
+  "ts_ms": 1792465947055,
+  "identity": "phone-409EE26F",
+  "image": "1792465947055_phone-409EE26F.jpg"
+}

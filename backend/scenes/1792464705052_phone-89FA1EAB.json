@@ -1,0 +1,19 @@
+{
+  "title": "Seen: headphones",
+  "detail": "headphones 54%",
+  "objects": [
+    {
+      "label": "headphones",
+      "confidence": 0.54,
+      "box": [
+        0.609,
+        0.44,
+        0.391,
+        0.351
+      ]
+    }
+  ],
+  "ts_ms": 1792464705052,
+  "identity": "phone-89FA1EAB",
+  "image": "1792464705052_phone-89FA1EAB.jpg"
+}

@@ -1,0 +1,19 @@
+{
+  "title": "Seen: credit card",
+  "detail": "credit card 36%",
+  "objects": [
+    {
+      "label": "credit card",
+      "confidence": 0.36,
+      "box": [
+        0.777,
+        0.552,
+        0.221,
+        0.186
+      ]
+    }
+  ],
+  "ts_ms": 1792464728339,
+  "identity": "phone-89FA1EAB",
+  "image": "1792464728339_phone-89FA1EAB.jpg"
+}

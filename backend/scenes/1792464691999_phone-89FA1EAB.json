@@ -1,0 +1,19 @@
+{
+  "title": "Seen: water bottle",
+  "detail": "water bottle 54%",
+  "objects": [
+    {
+      "label": "water bottle",
+      "confidence": 0.54,
+      "box": [
+        0.598,
+        0.483,
+        0.278,
+        0.323
+      ]
+    }
+  ],
+  "ts_ms": 1792464691999,
+  "identity": "phone-89FA1EAB",
+  "image": "1792464691999_phone-89FA1EAB.jpg"
+}

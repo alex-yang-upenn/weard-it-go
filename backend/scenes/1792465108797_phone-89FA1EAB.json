@@ -1,0 +1,19 @@
+{
+  "title": "Seen: watch",
+  "detail": "watch 85%",
+  "objects": [
+    {
+      "label": "watch",
+      "confidence": 0.85,
+      "box": [
+        0.477,
+        0.785,
+        0.289,
+        0.18
+      ]
+    }
+  ],
+  "ts_ms": 1792465108797,
+  "identity": "phone-89FA1EAB",
+  "image": "1792465108797_phone-89FA1EAB.jpg"
+}
