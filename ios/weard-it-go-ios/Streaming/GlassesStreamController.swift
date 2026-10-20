@@ -377,8 +377,8 @@ final class GlassesStreamController {
     }
 
     private func receive(_ alert: AlertEvent) {
-        alerts.insert(alert, at: 0)
-        if alerts.count > 50 { alerts.removeLast(alerts.count - 50) }
+        alerts.append(alert)
+        if alerts.count > 50 { alerts.removeFirst(alerts.count - 50) }
         haptics.notificationOccurred(.warning)
 
         let content = UNMutableNotificationContent()
