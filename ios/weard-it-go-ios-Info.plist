@@ -49,6 +49,8 @@
 	<array>
 		<string>_bonjour._tcp</string>
 	</array>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Records where you are when the glasses see something, so you can find it later.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Used only in debug builds to feed the phone camera into simulated glasses.</string>
 	<!-- Allow plain ws:// to LAN / .local dev servers; use wss:// for anything public. -->

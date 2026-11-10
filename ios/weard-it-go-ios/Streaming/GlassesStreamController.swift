@@ -88,7 +88,7 @@ final class GlassesStreamController {
     @ObservationIgnored private var camera: MWDATCamera.Camera?
     @ObservationIgnored private var settings = StreamSettings()
     @ObservationIgnored private var publisher: LiveKitPublisher?
-    @ObservationIgnored private let identity = "phone-" + UUID().uuidString.prefix(8)
+    @ObservationIgnored private let identity = DeviceIdentity.phone
     @ObservationIgnored private let counters = Counters()
     @ObservationIgnored private let sessionTokens = ListenerTokenBag()
     @ObservationIgnored private let streamTokens = ListenerTokenBag()

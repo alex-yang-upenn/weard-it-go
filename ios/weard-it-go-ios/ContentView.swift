@@ -12,6 +12,7 @@ struct ContentView: View {
     @Bindable var controller: GlassesStreamController
     @AppStorage(StreamSettings.Key.backendURL) private var backendURL = StreamSettings().backendURL
     @State private var showSettings = false
+    @State private var locationTracker = LocationTracker()
     #if DEBUG
     @State private var mockGlasses = MockGlassesController()
     #endif
@@ -20,6 +21,7 @@ struct ContentView: View {
         NavigationStack {
             List {
                 glassesSection
+                locationSection
                 if controller.isRegistered {
                     streamSection
                     alertsSection
@@ -117,6 +119,33 @@ struct ContentView: View {
             LabeledContent("Glasses → phone", value: String(format: "%.0f fps", controller.stats.glassesFPS))
             LabeledContent("Phone → LiveKit", value: String(format: "%.0f fps", controller.stats.publishFPS))
             LabeledContent("Frames published", value: "\(controller.stats.framesPublished)")
+        }
+    }
+
+    private var locationSection: some View {
+        Section("Location") {
+            LabeledContent("Status", value: locationTracker.statusText)
+            if let loc = locationTracker.location {
+                LabeledContent("Coordinates", value: String(format: "%.6f, %.6f", loc.coordinate.latitude, loc.coordinate.longitude))
+                LabeledContent("Accuracy", value: String(format: "±%.0f m", loc.horizontalAccuracy))
+            }
+            if locationTracker.isRunning {
+                LabeledContent("Sent to backend") {
+                    VStack(alignment: .trailing) {
+                        if let sentAt = locationTracker.lastSentAt {
+                            Text("\(locationTracker.sentCount) · last \(sentAt.formatted(date: .omitted, time: .standard))")
+                        } else {
+                            Text("Not yet")
+                        }
+                        if let error = locationTracker.sendError {
+                            Text(error).font(.caption).foregroundStyle(.red)
+                        }
+                    }
+                }
+            }
+            Button(locationTracker.isRunning ? "Stop Location" : "Start Location") {
+                locationTracker.isRunning ? locationTracker.stop() : locationTracker.start()
+            }
         }
     }
 

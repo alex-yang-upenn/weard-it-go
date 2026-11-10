@@ -3,6 +3,10 @@
 One process that:
   1. Serves access tokens to the iOS app:  GET /token?identity=<id>
      -> {"url": "ws://<this-host>:7880", "token": "...", "room": "glasses"}
+     and takes the phone's GPS position:   POST /location
+     {"identity": "...", "lat": ..., "lon": ..., "accuracy_m": ..., "ts_ms": ...}
+     Samples are appended to scenes/locations.jsonl, and each saved scene JSON
+     gets the phone's latest known "location".
   2. Joins the same LiveKit room as "agent", subscribes to the glasses video,
      samples frames, runs YOLOE open-vocabulary detection on them, and pings
      the phone back over LiveKit RPC (method "alert") when objects come into view.
@@ -61,6 +65,10 @@ YOLOE_CLASSES = os.environ.get("YOLOE_CLASSES", DEFAULT_CLASSES)
 MODELS_DIR = Path(__file__).parent / "models"
 SCENES_DIR = Path(os.environ.get("SCENES_DIR", Path(__file__).parent / "scenes"))
 AGENT_IDENTITY = "agent"
+LOCATIONS_FILE = SCENES_DIR / "locations.jsonl"
+
+# identity -> most recent location sample from that phone.
+latest_location: dict[str, dict] = {}
 
 log = logging.getLogger("live_agent")
 
@@ -177,6 +185,30 @@ async def token_handler(request: web.Request) -> web.Response:
     return web.json_response(body)
 
 
+async def location_handler(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+        sample = {
+            "identity": str(body["identity"]),
+            "lat": float(body["lat"]),
+            "lon": float(body["lon"]),
+            "accuracy_m": float(body.get("accuracy_m", -1)),
+            "ts_ms": int(body.get("ts_ms") or time.time() * 1000),
+        }
+    except (ValueError, KeyError, TypeError):
+        return web.json_response({"error": "expected identity, lat, lon"}, status=400)
+    if not (-90 <= sample["lat"] <= 90 and -180 <= sample["lon"] <= 180):
+        return web.json_response({"error": "lat/lon out of range"}, status=400)
+
+    latest_location[sample["identity"]] = sample
+    SCENES_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCATIONS_FILE.open("a") as f:
+        f.write(json.dumps(sample) + "\n")
+    log.info("location from %s: %.6f, %.6f (±%.0f m)", sample["identity"], sample["lat"], sample["lon"],
+             sample["accuracy_m"])
+    return web.json_response({"ok": True})
+
+
 # --------------------------------------------------------------------------
 # Agent
 # --------------------------------------------------------------------------
@@ -225,9 +257,12 @@ def save_scene(rgb: np.ndarray, identity: str, event: Event) -> Path:
     stem = SCENES_DIR / f"{ts_ms}_{identity}"
     image_path = stem.with_suffix(".jpg")
     Image.fromarray(rgb).save(image_path, quality=90)
-    stem.with_suffix(".json").write_text(
-        json.dumps({**asdict(event), "ts_ms": ts_ms, "identity": identity, "image": image_path.name}, indent=2)
-    )
+    scene = {**asdict(event), "ts_ms": ts_ms, "identity": identity, "image": image_path.name}
+    # The phone only reports when it moves, so the last sample still applies while
+    # standing still. age_s says how old it is.
+    if (loc := latest_location.get(identity)) is not None:
+        scene["location"] = {**loc, "age_s": round((ts_ms - loc["ts_ms"]) / 1000, 1)}
+    stem.with_suffix(".json").write_text(json.dumps(scene, indent=2))
     log.info("saved scene %s", image_path)
     return image_path
 
@@ -277,6 +312,7 @@ async def run_agent() -> None:
 async def main() -> None:
     app = web.Application()
     app.router.add_get("/token", token_handler)
+    app.router.add_post("/location", location_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", TOKEN_PORT).start()
