@@ -3,3 +3,9 @@
 # Xcode per-user workspace state
 xcuserdata/
 *.xcuserstate
+
+# Python
+__pycache__/
+
+# Secrets
+.env

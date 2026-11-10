@@ -1,0 +1,41 @@
+# One GPU box: Redis + one inference server.
+#   cp .env.example .env   # fill in TURBOPUFFER_API_KEY and REDIS_PASSWORD
+#   docker compose up --build
+#
+# More servers: run this same image on other GPU machines with REDIS_URL pointing
+# here (e.g. `docker compose up inference` there with REDIS_URL set in .env).
+# On a multi-GPU box, add one service per GPU with `device_ids: ["1"]`, etc.;
+# two containers on the same GPU will not fit.
+services:
+  redis:
+    image: redis:7.4-alpine
+    # appendonly: queued jobs survive a Redis restart.
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}"]
+    ports: ["6379:6379"]  # the backend (live_agent.py) pushes jobs here
+    volumes: [redis-data:/data]
+    restart: unless-stopped
+
+  inference:
+    build: .
+    image: weard-it-go-inference:latest
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
+    depends_on: [redis]
+    volumes:
+      - hf-cache:/root/.cache/huggingface  # model weights, downloaded once
+    ipc: host  # vLLM needs more shared memory than Docker's default
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+volumes:
+  redis-data:
+  hf-cache:
