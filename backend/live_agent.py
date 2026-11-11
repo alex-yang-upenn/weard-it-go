@@ -3,9 +3,18 @@
 One process that:
   1. Serves access tokens to the iOS app:  GET /token?identity=<id>
      -> {"url": "ws://<this-host>:7880", "token": "...", "room": "glasses"}
+     and takes the phone's GPS position:   POST /location
+     {"identity": "...", "lat": ..., "lon": ..., "accuracy_m": ..., "ts_ms": ...}
+     Samples are appended to scenes/locations.jsonl, and each saved scene JSON
+     gets the phone's latest known "location".
   2. Joins the same LiveKit room as "agent", subscribes to the glasses video,
      samples frames, runs YOLOE open-vocabulary detection on them, and pings
      the phone back over LiveKit RPC (method "alert") when objects come into view.
+  3. Saves "scenes" (frame + detections) and queues them for the inference servers:
+       arrived   objects just came into view (also sent to the phone as an alert)
+       left      the last frame an object was in before it left view: where it was left
+       snapshot  every SNAPSHOT_EVERY_S when the view has changed, whatever YOLOE saw,
+                 so things YOLOE misses still get indexed
 
 Run (with a local dev LiveKit server, see dev.sh):
     pip install -r requirements.txt
@@ -25,11 +34,22 @@ Environment (defaults match `livekit-server --dev`):
     YOLOE_CONF          0.35                  minimum detection confidence
     FORGET_AFTER_S      30                    re-announce an object after it's been
                                               out of view this long
+    LEFT_VIEW_S         3                     unseen this long = it left view; save
+                                              its last frame
+    SNAPSHOT_EVERY_S    20                    at most one snapshot this often; 0 = off
+    SNAPSHOT_MIN_CHANGE 0.08                  how different the view must be from the
+                                              last saved scene (0-1, mean pixel change)
+    REDIS_URL           (unset)               e.g. redis://localhost:6379; when set, each
+                                              saved scene is queued for the inference
+                                              servers (see ../inference)
+    INDEX_STREAM        scenes:index          Redis stream the scenes are queued on
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import logging
 import os
@@ -52,6 +72,9 @@ ANALYZE_FPS = float(os.environ.get("ANALYZE_FPS", "2"))
 YOLOE_MODEL = os.environ.get("YOLOE_MODEL", "yoloe-26s-seg.pt")
 YOLOE_CONF = float(os.environ.get("YOLOE_CONF", "0.35"))
 FORGET_AFTER_S = float(os.environ.get("FORGET_AFTER_S", "30"))
+LEFT_VIEW_S = float(os.environ.get("LEFT_VIEW_S", "3"))
+SNAPSHOT_EVERY_S = float(os.environ.get("SNAPSHOT_EVERY_S", "20"))
+SNAPSHOT_MIN_CHANGE = float(os.environ.get("SNAPSHOT_MIN_CHANGE", "0.08"))
 # Everyday things people misplace. Any text works: YOLOE is open-vocabulary.
 DEFAULT_CLASSES = (
     "keys,wallet,phone,glasses,sunglasses,earbuds case,headphones,watch,backpack,"
@@ -61,6 +84,16 @@ YOLOE_CLASSES = os.environ.get("YOLOE_CLASSES", DEFAULT_CLASSES)
 MODELS_DIR = Path(__file__).parent / "models"
 SCENES_DIR = Path(os.environ.get("SCENES_DIR", Path(__file__).parent / "scenes"))
 AGENT_IDENTITY = "agent"
+LOCATIONS_FILE = SCENES_DIR / "locations.jsonl"
+REDIS_URL = os.environ.get("REDIS_URL", "")
+INDEX_STREAM = os.environ.get("INDEX_STREAM", "scenes:index")
+INDEX_STREAM_MAXLEN = 10_000  # cap so an idle queue can't grow without bound
+
+# Set in main() when REDIS_URL is configured.
+redis_client = None
+
+# identity -> most recent location sample from that phone.
+latest_location: dict[str, dict] = {}
 
 log = logging.getLogger("live_agent")
 
@@ -72,19 +105,23 @@ log = logging.getLogger("live_agent")
 
 @dataclass
 class Event:
+    kind: str  # "arrived" | "left" | "snapshot"
     title: str
     detail: str = ""
     objects: list[dict] = field(default_factory=list)
 
 
-class YoloeDetector:
-    """Open-vocabulary detection with YOLOE; reports objects as they come into view.
+@dataclass
+class Scene:
+    """An event plus the frame to save with it (not always the latest frame)."""
 
-    Gets RGB uint8 frames of shape (height, width, 3) at ANALYZE_FPS. An object
-    is announced once it's been detected in two consecutive analyzed frames
-    (filters one-frame false positives), then not again until it's been out of
-    view for FORGET_AFTER_S.
-    """
+    event: Event
+    rgb: np.ndarray
+    ts_ms: int
+
+
+class YoloeDetector:
+    """Open-vocabulary detection with YOLOE. Shared by all video streams."""
 
     def __init__(self) -> None:
         import torch
@@ -106,11 +143,8 @@ class YoloeDetector:
         log.info("YOLOE %s on %s, looking for: %s", weights, self.device,
                  "everything (prompt-free)" if prompt_free else ", ".join(classes))
 
-        self._pending: set[str] = set()       # seen in the previous frame, not yet announced
-        self._last_seen: dict[str, float] = {}  # label -> time last detected
-        self._announced: set[str] = set()     # currently "in view" and already announced
-
-    def analyze(self, rgb: np.ndarray) -> Event | None:
+    def detect(self, rgb: np.ndarray) -> dict[str, dict]:
+        """RGB uint8 (height, width, 3) -> best detection per label."""
         result = self.model.predict(rgb[..., ::-1], device=self.device, conf=YOLOE_CONF, verbose=False)[0]
         height, width = rgb.shape[:2]
         best: dict[str, dict] = {}
@@ -125,28 +159,113 @@ class YoloeDetector:
                     "box": [round(x1 / width, 3), round(y1 / height, 3),
                             round((x2 - x1) / width, 3), round((y2 - y1) / height, 3)],
                 }
+        return best
 
-        now = time.monotonic()
-        for label in best:
+
+@dataclass
+class _Seen:
+    """A frame an object was detected in."""
+
+    rgb: np.ndarray
+    ts_ms: int
+    detections: dict[str, dict]
+
+
+def _thumbnail(rgb: np.ndarray, size: int = 16) -> np.ndarray:
+    """16x16 block-averaged grayscale, brightness removed, for cheap 'did the view change?'."""
+    height, width = rgb.shape[:2]
+    bh, bw = max(1, height // size), max(1, width // size)
+    gray = rgb[: bh * size, : bw * size].mean(axis=2).reshape(size, bh, size, bw).mean(axis=(1, 3)) / 255
+    return gray - gray.mean()
+
+
+class SightingTracker:
+    """Turns per-frame detections from one video stream into scenes worth saving.
+
+    arrived:  an object detected in two consecutive analyzed frames (filters
+              one-frame false positives), not again until it's been out of view
+              for FORGET_AFTER_S.
+    left:     an arrived object unseen for LEFT_VIEW_S. Saved with the last frame
+              it was detected in, which shows where it was put down. Objects that
+              left from the same frame share one scene.
+    snapshot: at most every SNAPSHOT_EVERY_S, when the view differs enough from
+              the last saved scene, regardless of detections.
+    """
+
+    def __init__(self) -> None:
+        self._pending: set[str] = set()         # seen in the previous frame, not yet announced
+        self._last_seen: dict[str, float] = {}  # label -> time last detected
+        self._announced: set[str] = set()       # announced, not yet forgotten
+        self._prev_visible: set[str] = set()
+        self._in_view: dict[str, _Seen] = {}     # announced and in view -> last frame it was in
+        self._snapshot_ref: np.ndarray | None = None
+        self._snapshot_at = float("-inf")  # snapshot the first frame
+
+    def update(self, rgb: np.ndarray, detections: dict[str, dict], now: float, ts_ms: int) -> list[Scene]:
+        """rgb must not be modified afterwards: it may be kept for a later 'left' scene."""
+        scenes: list[Scene] = []
+        visible = set(detections)
+        for label in visible:
             self._last_seen[label] = now
         # Forget things that have been out of view long enough to re-announce.
         for label in list(self._announced):
             if now - self._last_seen.get(label, 0) > FORGET_AFTER_S:
                 self._announced.discard(label)
 
-        visible = set(best)
         confirmed = (visible & self._pending) - self._announced
         self._pending = visible - self._announced
-        if not confirmed:
-            return None
-        self._announced |= confirmed
-        objects = sorted((best[label] for label in confirmed), key=lambda o: -o["confidence"])
-        names = [o["label"] for o in objects]
-        return Event(
-            title=f"Seen: {', '.join(names)}",
-            detail=", ".join(f"{o['label']} {o['confidence']:.0%}" for o in objects),
-            objects=objects,
-        )
+        if confirmed:
+            self._announced |= confirmed
+            objects = sorted((detections[label] for label in confirmed), key=lambda o: -o["confidence"])
+            scenes.append(Scene(_event("arrived", "Seen", objects), rgb, ts_ms))
+
+        # Remember the latest frame each announced object is in. Needing two frames
+        # in a row (or already being in view) keeps a one-frame blip from moving it.
+        seen = _Seen(rgb, ts_ms, detections)
+        for label in visible & self._announced:
+            if label in self._in_view or label in self._prev_visible:
+                self._in_view[label] = seen
+        self._prev_visible = visible
+
+        gone = [label for label in self._in_view if now - self._last_seen[label] > LEFT_VIEW_S]
+        scenes += self._departures(gone)
+
+        if not scenes and SNAPSHOT_EVERY_S > 0 and now - self._snapshot_at >= SNAPSHOT_EVERY_S:
+            thumb = _thumbnail(rgb)
+            ref = self._snapshot_ref
+            if ref is None or ref.shape != thumb.shape or float(np.abs(thumb - ref).mean()) >= SNAPSHOT_MIN_CHANGE:
+                objects = sorted(detections.values(), key=lambda o: -o["confidence"])
+                scenes.append(Scene(_event("snapshot", "Snapshot", objects), rgb, ts_ms))
+        # Any scene of the current view counts as covering it for snapshots.
+        if any(scene.rgb is rgb for scene in scenes):
+            self._snapshot_at = now
+            self._snapshot_ref = _thumbnail(rgb)
+        return scenes
+
+    def flush(self) -> list[Scene]:
+        """The stream ended: everything still in view left from its last frame."""
+        return self._departures(list(self._in_view))
+
+    def _departures(self, labels: list[str]) -> list[Scene]:
+        by_frame: dict[int, tuple[_Seen, list[str]]] = {}
+        for label in labels:
+            seen = self._in_view.pop(label)
+            by_frame.setdefault(id(seen), (seen, []))[1].append(label)
+        scenes = []
+        for seen, frame_labels in by_frame.values():
+            objects = sorted((seen.detections[label] for label in frame_labels), key=lambda o: -o["confidence"])
+            scenes.append(Scene(_event("left", "Last seen", objects), seen.rgb, seen.ts_ms))
+        return scenes
+
+
+def _event(kind: str, verb: str, objects: list[dict]) -> Event:
+    names = ", ".join(o["label"] for o in objects) or "nothing detected"
+    return Event(
+        kind=kind,
+        title=f"{verb}: {names}",
+        detail=", ".join(f"{o['label']} {o['confidence']:.0%}" for o in objects),
+        objects=objects,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -177,6 +296,30 @@ async def token_handler(request: web.Request) -> web.Response:
     return web.json_response(body)
 
 
+async def location_handler(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+        sample = {
+            "identity": str(body["identity"]),
+            "lat": float(body["lat"]),
+            "lon": float(body["lon"]),
+            "accuracy_m": float(body.get("accuracy_m", -1)),
+            "ts_ms": int(body.get("ts_ms") or time.time() * 1000),
+        }
+    except (ValueError, KeyError, TypeError):
+        return web.json_response({"error": "expected identity, lat, lon"}, status=400)
+    if not (-90 <= sample["lat"] <= 90 and -180 <= sample["lon"] <= 180):
+        return web.json_response({"error": "lat/lon out of range"}, status=400)
+
+    latest_location[sample["identity"]] = sample
+    SCENES_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCATIONS_FILE.open("a") as f:
+        f.write(json.dumps(sample) + "\n")
+    log.info("location from %s: %.6f, %.6f (±%.0f m)", sample["identity"], sample["lat"], sample["lon"],
+             sample["accuracy_m"])
+    return web.json_response({"ok": True})
+
+
 # --------------------------------------------------------------------------
 # Agent
 # --------------------------------------------------------------------------
@@ -185,6 +328,7 @@ async def token_handler(request: web.Request) -> web.Response:
 async def watch_track(room: rtc.Room, track: rtc.RemoteVideoTrack, participant: rtc.RemoteParticipant,
                       detector: YoloeDetector) -> None:
     stream = rtc.VideoStream(track, format=rtc.VideoBufferType.RGB24)
+    tracker = SightingTracker()
     min_interval = 1.0 / ANALYZE_FPS
     next_at = 0.0
     received = analyzed = 0
@@ -205,31 +349,61 @@ async def watch_track(room: rtc.Room, track: rtc.RemoteVideoTrack, participant: 
             analyzed += 1
 
             frame = frame_event.frame
-            rgb = np.frombuffer(frame.data, dtype=np.uint8).reshape(frame.height, frame.width, 3)
+            # Copy: the tracker may hold on to this frame for a later "left" scene.
+            rgb = np.frombuffer(frame.data, dtype=np.uint8).reshape(frame.height, frame.width, 3).copy()
+            ts_ms = int(time.time() * 1000)
             # Inference runs off the event loop so LiveKit keeps flowing.
-            event = await asyncio.to_thread(detector.analyze, rgb)
-            if event is not None:
-                asyncio.create_task(asyncio.to_thread(save_scene, rgb.copy(), participant.identity, event))
-                asyncio.create_task(send_alert(room, participant.identity, event))
+            detections = await asyncio.to_thread(detector.detect, rgb)
+            for scene in tracker.update(rgb, detections, time.monotonic(), ts_ms):
+                asyncio.create_task(save_and_enqueue(scene, participant.identity))
+                if scene.event.kind == "arrived":
+                    asyncio.create_task(send_alert(room, participant.identity, scene.event))
     finally:
+        for scene in tracker.flush():
+            asyncio.create_task(save_and_enqueue(scene, participant.identity))
         await stream.aclose()
         log.info("stopped watching %s", participant.identity)
 
 
-def save_scene(rgb: np.ndarray, identity: str, event: Event) -> Path:
-    """Write the frame (JPEG) plus detections (JSON) so a VLM can be run on it."""
+def save_scene(scene: Scene, identity: str) -> tuple[dict, bytes]:
+    """Write the frame (JPEG) plus detections (JSON) so a VLM can be run on it.
+
+    Returns the scene dict and the JPEG bytes.
+    """
     from PIL import Image
 
     SCENES_DIR.mkdir(parents=True, exist_ok=True)
-    ts_ms = int(time.time() * 1000)
-    stem = SCENES_DIR / f"{ts_ms}_{identity}"
+    ts_ms = scene.ts_ms  # when the frame was captured, not now ("left" frames are older)
+    # kind in the name: an "arrived" and a "left" scene can share one frame.
+    scene_id = f"{ts_ms}_{identity}_{scene.event.kind}"
+    stem = SCENES_DIR / scene_id
     image_path = stem.with_suffix(".jpg")
-    Image.fromarray(rgb).save(image_path, quality=90)
-    stem.with_suffix(".json").write_text(
-        json.dumps({**asdict(event), "ts_ms": ts_ms, "identity": identity, "image": image_path.name}, indent=2)
-    )
-    log.info("saved scene %s", image_path)
-    return image_path
+    buf = io.BytesIO()
+    Image.fromarray(scene.rgb).save(buf, format="JPEG", quality=90)
+    jpeg = buf.getvalue()
+    image_path.write_bytes(jpeg)
+    record = {"id": scene_id, **asdict(scene.event), "ts_ms": ts_ms, "identity": identity, "image": image_path.name}
+    # The phone only reports when it moves, so the last sample still applies while
+    # standing still. age_s says how old it is.
+    if (loc := latest_location.get(identity)) is not None:
+        record["location"] = {**loc, "age_s": round((ts_ms - loc["ts_ms"]) / 1000, 1)}
+    stem.with_suffix(".json").write_text(json.dumps(record, indent=2))
+    log.info("saved scene %s (%s)", image_path.name, scene.event.title)
+    return record, jpeg
+
+
+async def save_and_enqueue(scene: Scene, identity: str) -> None:
+    record, jpeg = await asyncio.to_thread(save_scene, scene, identity)
+    if redis_client is None:
+        return
+    # The image rides along in the job (~15-35 KB), so inference servers on other
+    # machines don't need access to this disk.
+    job = {**record, "image_b64": base64.b64encode(jpeg).decode("ascii")}
+    try:
+        await redis_client.xadd(INDEX_STREAM, {"job": json.dumps(job)},
+                                maxlen=INDEX_STREAM_MAXLEN, approximate=True)
+    except Exception as exc:  # queue down: keep detecting, the scene is still on disk
+        log.warning("could not queue scene %s for indexing: %s", record["image"], exc)
 
 
 async def send_alert(room: rtc.Room, identity: str, event: Event) -> None:
@@ -275,8 +449,18 @@ async def run_agent() -> None:
 
 
 async def main() -> None:
+    global redis_client
+    if REDIS_URL:
+        import redis.asyncio as redis
+
+        redis_client = redis.from_url(REDIS_URL)
+        from urllib.parse import urlsplit
+
+        # Don't log the URL itself: it may carry the Redis password.
+        log.info("queueing scenes on redis %s stream %r", urlsplit(REDIS_URL).hostname, INDEX_STREAM)
     app = web.Application()
     app.router.add_get("/token", token_handler)
+    app.router.add_post("/location", location_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", TOKEN_PORT).start()

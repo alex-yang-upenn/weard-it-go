@@ -1,0 +1,4 @@
+# vLLM, torch and openai come with the base image (vllm/vllm-openai).
+redis>=5,<7
+turbopuffer>=3.1,<4
+aiohttp>=3.10

@@ -10,3 +10,4 @@ qwen-vl-utils>=0.0.14
 numpy>=2.0
 ultralytics>=8.4
 git+https://github.com/ultralytics/CLIP.git
+redis>=5
