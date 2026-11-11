@@ -1,42 +1,51 @@
-"""Embed object crops from saved scenes with local Qwen3-VL-Embedding.
+"""Consume Redis scene jobs and embed object crops with local Qwen3-VL-Embedding.
 
-Run from the repository root or backend directory:
-    git clone https://github.com/QwenLM/Qwen3-VL-Embedding.git backend/Qwen3-VL-Embedding
-    # Download Qwen/Qwen3-VL-Embedding-2B into backend/models/Qwen3-VL-Embedding-2B
-    python backend/embedding_worker.py
+Run from the repository root after Redis and the local Qwen model are available:
+    REDIS_URL=redis://localhost:6379 python backend/embedding_worker.py
 
-The worker polls backend/scenes for scene JSON files, crops each object's
-normalized [x, y, width, height] box, and appends one JSON record per embedding
-to backend/object_embeddings.jsonl. It keeps running by default; use --once to
-process the current backlog and exit.
+Scene jobs use the same Redis stream and payload as inference/worker.py, but
+this worker uses its own consumer group so both workers receive every scene.
+It crops each object's normalized [x, y, width, height] box from the queued
+image, then appends one JSON record per embedding to
+backend/object_embeddings.jsonl. Use --once to drain available jobs.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import base64
 import json
 import logging
 import os
+import socket
 import sys
+import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
+import redis.asyncio as redis
 
 BACKEND_DIR = Path(__file__).resolve().parent
-SCENES_DIR = Path(os.environ.get("SCENES_DIR", BACKEND_DIR / "scenes"))
 OUTPUT_PATH = Path(os.environ.get("EMBEDDINGS_PATH", BACKEND_DIR / "object_embeddings.jsonl"))
 MODEL_ID = os.environ.get("QWEN_EMBEDDING_MODEL", "Qwen/Qwen3-VL-Embedding-2B")
 MODEL_PATH = Path(os.environ.get("QWEN_EMBEDDING_MODEL_PATH", BACKEND_DIR / "models" / "Qwen3-VL-Embedding-2B"))
 QWEN_REPO = Path(os.environ.get("QWEN_EMBEDDING_REPO", BACKEND_DIR / "Qwen3-VL-Embedding"))
 MODEL = "qwen3-vl-embedding-2b"
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+STREAM = os.environ.get("STREAM", "scenes:index")
+GROUP = os.environ.get("QWEN_EMBEDDING_GROUP", "qwen-embedders")
+CONSUMER = os.environ.get("QWEN_EMBEDDING_CONSUMER") or f"{socket.gethostname()}-{os.getpid()}"
+CLAIM_IDLE_MS = int(os.environ.get("QWEN_CLAIM_IDLE_MS", "120000"))
+MAX_ATTEMPTS = int(os.environ.get("QWEN_MAX_ATTEMPTS", "3"))
+RECLAIM_EVERY_S = min(30.0, CLAIM_IDLE_MS / 4000)
 EMBEDDING_INSTRUCTION = os.environ.get(
     "QWEN_EMBEDDING_INSTRUCTION",
     "Represent this object crop for visual instance retrieval.",
 )
-POLL_SECONDS = float(os.environ.get("EMBEDDING_POLL_SECONDS", "3"))
 PADDING_FRACTION = float(os.environ.get("EMBEDDING_CROP_PADDING", "0.12"))
 
 log = logging.getLogger("embedding_worker")
@@ -45,7 +54,8 @@ log = logging.getLogger("embedding_worker")
 @dataclass(frozen=True)
 class CropJob:
     key: str
-    scene_path: Path
+    redis_message_id: str
+    scene_id: str
     image_name: str
     ts_ms: int | None
     identity: str | None
@@ -56,18 +66,17 @@ class CropJob:
     crop_bytes: bytes
 
 
-def _crop_bytes(image_path: Path, box: list[float]) -> bytes:
-    """Crop normalized xywh coordinates and return JPEG bytes."""
+def _crop_bytes(image: Image.Image, box: list[float]) -> bytes:
+    """Crop normalized xywh coordinates from a decoded scene image."""
     if len(box) != 4:
         raise ValueError(f"expected xywh box with 4 values, got {box!r}")
-    with Image.open(image_path) as source:
-        image = source.convert("RGB")
+    image = image.convert("RGB")
     width, height = image.size
     x, y, w, h = (float(value) for value in box)
     if w <= 0 or h <= 0:
         raise ValueError(f"box has non-positive dimensions: {box!r}")
-    left, top = x * width, y * height
-    right, bottom = (x + w) * width, (y + h) * height
+    left, top = max(0.0, x) * width, max(0.0, y) * height
+    right, bottom = min(1.0, x + w) * width, min(1.0, y + h) * height
     pad_x, pad_y = (right - left) * PADDING_FRACTION, (bottom - top) * PADDING_FRACTION
     bounds = (
         max(0, int(left - pad_x)), max(0, int(top - pad_y)),
@@ -79,46 +88,6 @@ def _crop_bytes(image_path: Path, box: list[float]) -> bytes:
     buffer = BytesIO()
     crop.save(buffer, format="JPEG", quality=92, optimize=True)
     return buffer.getvalue()
-
-
-def load_jobs(completed: set[str]) -> list[CropJob]:
-    jobs: list[CropJob] = []
-    for scene_path in sorted(SCENES_DIR.glob("*.json")):
-        try:
-            scene = json.loads(scene_path.read_text())
-            image_name = scene.get("image")
-            image_path = (SCENES_DIR / image_name).resolve()
-            if image_path.parent != SCENES_DIR.resolve() or not image_path.is_file():
-                log.warning("scene image missing or outside scenes directory: %s", scene_path)
-                continue
-            for index, obj in enumerate(scene.get("objects") or []):
-                key = f"{MODEL}:{scene_path.name}:{index}"
-                if key in completed:
-                    continue
-                box = obj.get("box")
-                if not isinstance(box, list):
-                    log.warning("skipping object without box: %s object %d", scene_path.name, index)
-                    continue
-                try:
-                    crop = _crop_bytes(image_path, box)
-                except Exception as exc:
-                    log.warning("crop failed for %s object %d: %s", scene_path.name, index, exc)
-                    continue
-                jobs.append(CropJob(
-                    key=key,
-                    scene_path=scene_path,
-                    image_name=image_name,
-                    ts_ms=scene.get("ts_ms"),
-                    identity=scene.get("identity"),
-                    object_index=index,
-                    label=str(obj.get("label", "unknown")),
-                    confidence=obj.get("confidence"),
-                    box=[float(v) for v in box],
-                    crop_bytes=crop,
-                ))
-        except Exception:
-            log.exception("could not read scene %s", scene_path)
-    return jobs
 
 
 def load_completed() -> set[str]:
@@ -198,18 +167,21 @@ class LocalEmbedder:
         return vectors[0].detach().float().cpu().tolist()
 
 
-def embed_jobs(embedder: LocalEmbedder, jobs: list[CropJob]) -> None:
+async def embed_jobs(embedder: LocalEmbedder, jobs: list[CropJob]) -> bool:
     """Generate each vector locally and append it with the scene metadata."""
+    import asyncio
+    succeeded = True
     for job in jobs:
         try:
-            vector = embedder.embed(job.crop_bytes)
+            vector = await asyncio.to_thread(embedder.embed, job.crop_bytes)
             append_record({
                 "key": job.key,
                 "status": "embedded",
                 "model": MODEL_ID,
                 "dimensions": len(vector),
                 "embedding": vector,
-                "scene": job.scene_path.name,
+                "redis_message_id": job.redis_message_id,
+                "scene": job.scene_id,
                 "image": job.image_name,
                 "ts_ms": job.ts_ms,
                 "identity": job.identity,
@@ -221,33 +193,168 @@ def embed_jobs(embedder: LocalEmbedder, jobs: list[CropJob]) -> None:
             })
             log.info("embedded %s [%s], vector dimensions=%d", job.key, job.label, len(vector))
         except Exception as exc:
+            succeeded = False
             log.exception("embedding failed for %s", job.key)
             append_record({"key": job.key, "status": "error", "error": str(exc)})
+    return succeeded
 
 
-def run(once: bool) -> None:
-    embedder = LocalEmbedder()
-    while True:
-        completed = load_completed()
-        jobs = load_jobs(completed)
-        if jobs:
-            log.info("found %d object crops to embed", len(jobs))
-            embed_jobs(embedder, jobs)
-        if once:
-            return
-        import time
-        time.sleep(POLL_SECONDS)
+def parse_scene(fields: dict[str, str]) -> dict[str, Any]:
+    try:
+        scene = json.loads(fields["job"])
+        for required in ("ts_ms", "identity", "image", "image_b64"):
+            scene[required]
+        if not isinstance(scene.get("objects"), list):
+            raise ValueError("scene objects must be a list")
+        return scene
+    except (KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"malformed Redis scene job: {exc}") from exc
+
+
+def scene_jobs(scene: dict[str, Any], message_id: str, completed: set[str]) -> list[CropJob]:
+    try:
+        image_data = base64.b64decode(scene["image_b64"], validate=True)
+        with Image.open(BytesIO(image_data)) as decoded:
+            image = decoded.convert("RGB")
+    except Exception as exc:
+        raise ValueError(f"could not decode queued scene image: {exc}") from exc
+
+    scene_id = str(scene.get("id") or f"{scene['ts_ms']}_{scene['identity']}")
+    jobs: list[CropJob] = []
+    for index, obj in enumerate(scene.get("objects") or []):
+        key = f"{MODEL}:{scene_id}:{index}"
+        if key in completed:
+            continue
+        box = obj.get("box")
+        if not isinstance(box, list):
+            log.warning("skipping object without box in scene %s object %d", scene_id, index)
+            continue
+        crop = _crop_bytes(image, box)
+        jobs.append(CropJob(
+            key=key,
+            redis_message_id=message_id,
+            scene_id=scene_id,
+            image_name=str(scene["image"]),
+            ts_ms=scene.get("ts_ms"),
+            identity=scene.get("identity"),
+            object_index=index,
+            label=str(obj.get("label", "unknown")),
+            confidence=obj.get("confidence"),
+            box=[float(v) for v in box],
+            crop_bytes=crop,
+        ))
+    return jobs
+
+
+class RedisEmbeddingWorker:
+    def __init__(self, embedder: LocalEmbedder, once: bool) -> None:
+        self.redis = redis.from_url(REDIS_URL, decode_responses=True)
+        self.embedder = embedder
+        self.once = once
+        self.last_reclaim = 0.0
+
+    # Ensure the Redis consumer group exists, creating it if necessary.
+    async def ensure_group(self) -> None:
+        try:
+            # A new group starts at the oldest retained stream entry for backfill.
+            await self.redis.xgroup_create(STREAM, GROUP, id="0", mkstream=True)
+            log.info("created Redis consumer group %r on %r", GROUP, STREAM)
+        except redis.ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+
+    # Process a single message from the Redis stream, handling success, failure, and dead-lettering.
+    async def process(self, message_id: str, fields: dict[str, str]) -> None:
+        try:
+            scene = parse_scene(fields)
+            jobs = scene_jobs(scene, message_id, load_completed())
+            success = await embed_jobs(self.embedder, jobs)
+            if success:
+                await self.redis.xack(STREAM, GROUP, message_id)
+            else:
+                log.warning("leaving %s pending so failed crops can retry", message_id)
+        except ValueError as exc:
+            log.error("dead-lettering malformed scene %s: %s", message_id, exc)
+            await self.redis.xadd(f"{STREAM}:dead", {
+                **fields, "source_id": message_id, "reason": str(exc),
+            }, maxlen=10_000, approximate=True)
+            await self.redis.xack(STREAM, GROUP, message_id)
+        except Exception:
+            log.exception("scene job %s failed; leaving it pending for retry", message_id)
+
+    # Process a message while sending periodic heartbeats to keep the claim alive.
+    async def process_with_heartbeat(self, message_id: str, fields: dict[str, str]) -> None:
+        import asyncio
+
+        async def heartbeat() -> None:
+            while True:
+                await asyncio.sleep(RECLAIM_EVERY_S)
+                await self.redis.xclaim(
+                    STREAM, GROUP, CONSUMER, min_idle_time=0,
+                    message_ids=[message_id], justid=True,
+                )
+
+        task = asyncio.create_task(heartbeat())
+        try:
+            await self.process(message_id, fields)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    # Reclaim messages that have been idle for too long, dead-lettering those that exceed the retry limit.
+    async def reclaim(self) -> None:
+        cursor = "0-0"
+        while True:
+            cursor, messages, *_ = await self.redis.xautoclaim(
+                STREAM, GROUP, CONSUMER, min_idle_time=CLAIM_IDLE_MS,
+                start_id=cursor, count=10,
+            )
+            for message_id, fields in messages:
+                pending = await self.redis.xpending_range(
+                    STREAM, GROUP, min=message_id, max=message_id, count=1,
+                )
+                attempts = pending[0]["times_delivered"] if pending else 1
+                if attempts > MAX_ATTEMPTS:
+                    log.error("dead-lettering %s after %d deliveries", message_id, attempts)
+                    await self.redis.xadd(f"{STREAM}:dead", {
+                        **fields, "source_id": message_id,
+                        "reason": f"gave up after {attempts} deliveries",
+                    }, maxlen=10_000, approximate=True)
+                    await self.redis.xack(STREAM, GROUP, message_id)
+                else:
+                    log.info("retrying pending scene %s (delivery %d)", message_id, attempts)
+                    await self.process_with_heartbeat(message_id, fields)
+            if cursor == "0-0":
+                break
+
+    # Run the consumer loop, reclaiming stale messages and processing new ones.
+    async def run(self) -> None:
+        await self.ensure_group()
+        log.info("consumer %r reading stream %r in group %r", CONSUMER, STREAM, GROUP)
+        while True:
+            now = time.monotonic()
+            if now - self.last_reclaim >= RECLAIM_EVERY_S:
+                await self.reclaim()
+                self.last_reclaim = time.monotonic()
+            replies = await self.redis.xreadgroup(
+                GROUP, CONSUMER, {STREAM: ">"}, count=1, block=1000,
+            )
+            entries = [(message_id, fields) for _stream, messages in replies or []
+                       for message_id, fields in messages]
+            for message_id, fields in entries:
+                await self.process_with_heartbeat(message_id, fields)
+            if self.once and not entries:
+                return
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--once", action="store_true", help="process current scenes and exit")
+    parser.add_argument("--once", action="store_true", help="drain available Redis jobs and exit")
     args = parser.parse_args()
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
-    if not SCENES_DIR.is_dir():
-        raise SystemExit(f"Scenes directory not found: {SCENES_DIR}")
     try:
-        run(args.once)
+        embedder = LocalEmbedder()
+        asyncio.run(RedisEmbeddingWorker(embedder, args.once).run())
     except KeyboardInterrupt:
         log.info("stopped")
 
