@@ -1,8 +1,8 @@
 # Inference server
 
-Turns saved scenes (frame + YOLOE detections) into searchable memories in turbopuffer.
+Turns YOLOE-selected scenes (frame + detections, carried in Redis) into searchable memories in turbopuffer.
 
-`live_agent.py` saves three kinds of scene per video stream:
+`live_agent.py` queues three kinds of scene per video stream without writing scene images or metadata to disk:
 
 | kind | when | why |
 |---|---|---|
@@ -38,13 +38,29 @@ cd backend && .venv/bin/pip install -r requirements.txt
 REDIS_URL=redis://:<password>@<gpu-box>:6379 ./dev.sh
 ```
 
-`REDIS_URL` unset = the backend works as before and queues nothing.
+`REDIS_URL` is required by the backend. Selected frames are JPEG-encoded in memory and
+appended directly to `scenes:index`; the queue carries the image so inference machines
+do not need access to the backend's filesystem. GPS samples are kept in memory and
+attached to scene jobs.
 
-Backfill scenes already on disk (also the quickest test, no glasses needed):
+## Local object-crop embeddings
+
+`backend/embedding_worker.py` can consume the same stream and create one local
+Qwen3-VL-Embedding vector per detector box. It uses the separate Redis consumer
+group `qwen-embedders`, so it receives each scene independently of the inference
+worker's `indexers` group. The vectors are appended to
+`backend/object_embeddings.jsonl` for later matching or database import.
+
+Run it on the machine where the Qwen embedding checkpoint and source checkout
+are installed, using that machine's Redis URL:
 
 ```sh
-REDIS_URL=redis://:<password>@<gpu-box>:6379 python inference/enqueue_scenes.py
+REDIS_URL=redis://:<password>@<redis-host>:6379 \
+  backend/.venv-qwen/bin/python backend/embedding_worker.py
 ```
+
+On first start, the embedding consumer group reads retained stream entries as
+well as new scenes. Use `--once` to drain currently available jobs and exit.
 
 ## More servers
 

@@ -5,12 +5,11 @@ One process that:
      -> {"url": "ws://<this-host>:7880", "token": "...", "room": "glasses"}
      and takes the phone's GPS position:   POST /location
      {"identity": "...", "lat": ..., "lon": ..., "accuracy_m": ..., "ts_ms": ...}
-     Samples are appended to scenes/locations.jsonl, and each saved scene JSON
-     gets the phone's latest known "location".
+     The phone's latest location is kept in memory and attached to queued scenes.
   2. Joins the same LiveKit room as "agent", subscribes to the glasses video,
      samples frames, runs YOLOE open-vocabulary detection on them, and pings
      the phone back over LiveKit RPC (method "alert") when objects come into view.
-  3. Saves "scenes" (frame + detections) and queues them for the inference servers:
+  3. Encodes selected "scenes" (frame + detections) in memory and queues them:
        arrived   objects just came into view (also sent to the phone as an alert)
        left      the last frame an object was in before it left view: where it was left
        snapshot  every SNAPSHOT_EVERY_S when the view has changed, whatever YOLOE saw,
@@ -38,10 +37,9 @@ Environment (defaults match `livekit-server --dev`):
                                               its last frame
     SNAPSHOT_EVERY_S    20                    at most one snapshot this often; 0 = off
     SNAPSHOT_MIN_CHANGE 0.08                  how different the view must be from the
-                                              last saved scene (0-1, mean pixel change)
-    REDIS_URL           (unset)               e.g. redis://localhost:6379; when set, each
-                                              saved scene is queued for the inference
-                                              servers (see ../inference)
+                                              last queued scene (0-1, mean pixel change)
+    REDIS_URL           required              e.g. redis://localhost:6379; selected scenes
+                                              are queued for inference servers (see ../inference)
     INDEX_STREAM        scenes:index          Redis stream the scenes are queued on
 """
 
@@ -82,14 +80,12 @@ DEFAULT_CLASSES = (
 )
 YOLOE_CLASSES = os.environ.get("YOLOE_CLASSES", DEFAULT_CLASSES)
 MODELS_DIR = Path(__file__).parent / "models"
-SCENES_DIR = Path(os.environ.get("SCENES_DIR", Path(__file__).parent / "scenes"))
 AGENT_IDENTITY = "agent"
-LOCATIONS_FILE = SCENES_DIR / "locations.jsonl"
 REDIS_URL = os.environ.get("REDIS_URL", "")
 INDEX_STREAM = os.environ.get("INDEX_STREAM", "scenes:index")
 INDEX_STREAM_MAXLEN = 10_000  # cap so an idle queue can't grow without bound
 
-# Set in main() when REDIS_URL is configured.
+# Initialized in main(); scene processing requires Redis so frames aren't dropped.
 redis_client = None
 
 # identity -> most recent location sample from that phone.
@@ -180,16 +176,16 @@ def _thumbnail(rgb: np.ndarray, size: int = 16) -> np.ndarray:
 
 
 class SightingTracker:
-    """Turns per-frame detections from one video stream into scenes worth saving.
+    """Turns per-frame detections from one video stream into scenes worth queuing.
 
     arrived:  an object detected in two consecutive analyzed frames (filters
               one-frame false positives), not again until it's been out of view
               for FORGET_AFTER_S.
-    left:     an arrived object unseen for LEFT_VIEW_S. Saved with the last frame
+    left:     an arrived object unseen for LEFT_VIEW_S. Queued with the last frame
               it was detected in, which shows where it was put down. Objects that
               left from the same frame share one scene.
     snapshot: at most every SNAPSHOT_EVERY_S, when the view differs enough from
-              the last saved scene, regardless of detections.
+              the last queued scene, regardless of detections.
     """
 
     def __init__(self) -> None:
@@ -312,9 +308,6 @@ async def location_handler(request: web.Request) -> web.Response:
         return web.json_response({"error": "lat/lon out of range"}, status=400)
 
     latest_location[sample["identity"]] = sample
-    SCENES_DIR.mkdir(parents=True, exist_ok=True)
-    with LOCATIONS_FILE.open("a") as f:
-        f.write(json.dumps(sample) + "\n")
     log.info("location from %s: %.6f, %.6f (±%.0f m)", sample["identity"], sample["lat"], sample["lon"],
              sample["accuracy_m"])
     return web.json_response({"ok": True})
@@ -365,45 +358,38 @@ async def watch_track(room: rtc.Room, track: rtc.RemoteVideoTrack, participant: 
         log.info("stopped watching %s", participant.identity)
 
 
-def save_scene(scene: Scene, identity: str) -> tuple[dict, bytes]:
-    """Write the frame (JPEG) plus detections (JSON) so a VLM can be run on it.
-
-    Returns the scene dict and the JPEG bytes.
-    """
+def encode_scene(scene: Scene, identity: str) -> tuple[dict, bytes]:
+    """Encode a selected frame in memory and return its Redis job and JPEG bytes."""
     from PIL import Image
 
-    SCENES_DIR.mkdir(parents=True, exist_ok=True)
     ts_ms = scene.ts_ms  # when the frame was captured, not now ("left" frames are older)
     # kind in the name: an "arrived" and a "left" scene can share one frame.
     scene_id = f"{ts_ms}_{identity}_{scene.event.kind}"
-    stem = SCENES_DIR / scene_id
-    image_path = stem.with_suffix(".jpg")
     buf = io.BytesIO()
     Image.fromarray(scene.rgb).save(buf, format="JPEG", quality=90)
     jpeg = buf.getvalue()
-    image_path.write_bytes(jpeg)
-    record = {"id": scene_id, **asdict(scene.event), "ts_ms": ts_ms, "identity": identity, "image": image_path.name}
+    record = {"id": scene_id, **asdict(scene.event), "ts_ms": ts_ms, "identity": identity,
+              "image": f"{scene_id}.jpg"}
     # The phone only reports when it moves, so the last sample still applies while
     # standing still. age_s says how old it is.
     if (loc := latest_location.get(identity)) is not None:
         record["location"] = {**loc, "age_s": round((ts_ms - loc["ts_ms"]) / 1000, 1)}
-    stem.with_suffix(".json").write_text(json.dumps(record, indent=2))
-    log.info("saved scene %s (%s)", image_path.name, scene.event.title)
+    log.info("encoded scene %s (%s)", scene_id, scene.event.title)
     return record, jpeg
 
 
 async def save_and_enqueue(scene: Scene, identity: str) -> None:
-    record, jpeg = await asyncio.to_thread(save_scene, scene, identity)
-    if redis_client is None:
-        return
-    # The image rides along in the job (~15-35 KB), so inference servers on other
-    # machines don't need access to this disk.
+    record, jpeg = await asyncio.to_thread(encode_scene, scene, identity)
+    # The image rides along in the job, so inference servers need no shared disk.
     job = {**record, "image_b64": base64.b64encode(jpeg).decode("ascii")}
     try:
+        if redis_client is None:
+            raise RuntimeError("Redis is not initialized")
         await redis_client.xadd(INDEX_STREAM, {"job": json.dumps(job)},
                                 maxlen=INDEX_STREAM_MAXLEN, approximate=True)
-    except Exception as exc:  # queue down: keep detecting, the scene is still on disk
-        log.warning("could not queue scene %s for indexing: %s", record["image"], exc)
+        log.info("queued scene %s on %s", record["id"], INDEX_STREAM)
+    except Exception as exc:  # Keep detection alive; this frame is intentionally not persisted locally.
+        log.error("could not queue scene %s; frame was not saved locally: %s", record["id"], exc)
 
 
 async def send_alert(room: rtc.Room, identity: str, event: Event) -> None:
@@ -450,14 +436,16 @@ async def run_agent() -> None:
 
 async def main() -> None:
     global redis_client
-    if REDIS_URL:
-        import redis.asyncio as redis
+    if not REDIS_URL:
+        raise RuntimeError("REDIS_URL is required; selected frames are queued directly and are not saved locally")
+    import redis.asyncio as redis
 
-        redis_client = redis.from_url(REDIS_URL)
-        from urllib.parse import urlsplit
+    redis_client = redis.from_url(REDIS_URL)
+    await redis_client.ping()
+    from urllib.parse import urlsplit
 
-        # Don't log the URL itself: it may carry the Redis password.
-        log.info("queueing scenes on redis %s stream %r", urlsplit(REDIS_URL).hostname, INDEX_STREAM)
+    # Don't log the URL itself: it may carry the Redis password.
+    log.info("queueing scenes on redis %s stream %r", urlsplit(REDIS_URL).hostname, INDEX_STREAM)
     app = web.Application()
     app.router.add_get("/token", token_handler)
     app.router.add_post("/location", location_handler)
