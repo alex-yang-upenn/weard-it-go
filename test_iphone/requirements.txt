@@ -1,0 +1,4 @@
+livekit>=1.0
+av>=14
+httpx>=0.27
+numpy>=2.0

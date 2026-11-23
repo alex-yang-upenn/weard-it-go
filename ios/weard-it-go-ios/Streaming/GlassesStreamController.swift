@@ -4,6 +4,7 @@
 //
 
 import CoreImage
+import CoreLocation
 import CoreMedia
 import Foundation
 import LiveKit
@@ -11,11 +12,9 @@ import MWDATCamera
 import MWDATCore
 import Observation
 import UIKit
-import UserNotifications
 
 /// Owns the whole pipeline: Meta AI registration, the glasses `DeviceSession` and
-/// camera `Stream`, the downsampler, the LiveKit publisher, and alerts coming
-/// back from the backend.
+/// camera `Stream`, the downsampler, the LiveKit publisher, and GPS telemetry.
 ///
 /// Starting is event-driven: `start()` joins the LiveKit room and creates the
 /// glasses session; the camera is attached when the session reports `.started`.
@@ -43,9 +42,9 @@ final class GlassesStreamController {
         var framesPublished = 0
     }
 
-    // MARK: - Alerts from the backend
+    // MARK: - GPS telemetry
 
-    private(set) var alerts: [AlertEvent] = []
+    private(set) var telemetrySentCount = 0
 
     // MARK: - Errors
 
@@ -88,13 +87,13 @@ final class GlassesStreamController {
     @ObservationIgnored private var camera: MWDATCamera.Camera?
     @ObservationIgnored private var settings = StreamSettings()
     @ObservationIgnored private var publisher: LiveKitPublisher?
-    @ObservationIgnored private let identity = DeviceIdentity.phone
+    @ObservationIgnored private let userID = UserIdentity.userID
+    @ObservationIgnored private var latestLocation: CLLocation?
     @ObservationIgnored private let counters = Counters()
     @ObservationIgnored private let sessionTokens = ListenerTokenBag()
     @ObservationIgnored private let streamTokens = ListenerTokenBag()
     @ObservationIgnored private var monitorTasks: [Task<Void, Never>] = []
     @ObservationIgnored private var publisherEventsTask: Task<Void, Never>?
-    @ObservationIgnored private let haptics = UINotificationFeedbackGenerator()
 
     init(wearables: WearablesInterface = Wearables.shared) {
         self.wearables = wearables
@@ -142,7 +141,7 @@ final class GlassesStreamController {
         guard !isRunning else { return }
         settings = StreamSettings.load()
         guard !settings.backendURL.isEmpty else {
-            errorMessage = "Set your backend's address in Settings first, e.g. http://192.168.1.20:8765"
+            errorMessage = "Set your backend's address in Settings first, e.g. http://192.168.1.20:8000"
             return
         }
         guard let backendURL = URL(string: settings.backendURL),
@@ -170,20 +169,23 @@ final class GlassesStreamController {
         preview = nil
         isPublished = false
         counters.reset()
-        requestNotificationPermission()
+        telemetrySentCount = 0
 
         // Join the room first so the video track exists before frames arrive.
         let publisher = LiveKitPublisher()
         self.publisher = publisher
         observePublisher(publisher)
         do {
-            try await publisher.connect(backendURL: backendURL, identity: identity, settings: settings)
+            try await publisher.connect(backendURL: backendURL, userID: userID, settings: settings)
         } catch {
             errorMessage = "Couldn't reach the backend at \(settings.backendURL): \(error.localizedDescription)"
             stop()
             return
         }
         guard isRunning else { return }
+        if let latestLocation {
+            sendTelemetry(for: latestLocation)
+        }
 
         do throws(DeviceSessionError) {
             let session = try wearables.createSession(deviceSelector: deviceSelector)
@@ -213,8 +215,25 @@ final class GlassesStreamController {
         }
     }
 
-    func clearAlerts() {
-        alerts.removeAll()
+    /// Called with every new GPS fix. Sent to the backend while streaming; the latest
+    /// one is also sent as soon as the next stream connects.
+    func shareLocation(_ location: CLLocation) {
+        latestLocation = location
+        sendTelemetry(for: location)
+    }
+
+    private func sendTelemetry(for location: CLLocation) {
+        guard let publisher,
+              let telemetryJSON = try? JSONEncoder().encode(GpsTelemetry(location))
+        else { return }
+        Task {
+            do {
+                try await publisher.sendTelemetry(telemetryJSON)
+                telemetrySentCount += 1
+            } catch {
+                // Dropped; the next fix will be sent.
+            }
+        }
     }
 
     // MARK: - Session
@@ -369,29 +388,8 @@ final class GlassesStreamController {
                 case .framePublished:
                     counters.recordPublished()
                     stats.framesPublished += 1
-                case .alert(let alert):
-                    receive(alert)
                 }
             }
-        }
-    }
-
-    private func receive(_ alert: AlertEvent) {
-        alerts.append(alert)
-        if alerts.count > 50 { alerts.removeFirst(alerts.count - 50) }
-        haptics.notificationOccurred(.warning)
-
-        let content = UNMutableNotificationContent()
-        content.title = alert.title
-        content.body = alert.detail ?? ""
-        content.sound = .default
-        let request = UNNotificationRequest(identifier: alert.id.uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
-    }
-
-    private func requestNotificationPermission() {
-        Task {
-            _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
         }
     }
 

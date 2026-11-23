@@ -29,7 +29,7 @@ nonisolated struct StreamSettings: Sendable, Equatable {
     static let longEdges: [Int] = [224, 320, 480, 640, 1280]
     static let bitratesKbps: [Int] = [250, 500, 800, 1500, 3000]
 
-    /// The backend that issues LiveKit tokens, e.g. http://192.168.1.20:8765
+    /// The backend orchestrator that creates LiveKit sessions, e.g. http://192.168.1.20:8000
     var backendURL: String = ""
     var sourceResolution: SourceResolution = .low
     var sourceFrameRate: UInt = 15

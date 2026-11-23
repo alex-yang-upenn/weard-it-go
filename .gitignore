@@ -5,7 +5,14 @@ xcuserdata/
 *.xcuserstate
 
 # Python
-__pycache__/
+**/__pycache__/
+**/*.venv/
 
 # Secrets
-.env
+**/*.env
+
+# Data
+backend/ingest/data/
+test_iphone/sample_videos/
+*.jpg
+**/model_cache/

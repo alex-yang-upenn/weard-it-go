@@ -1,0 +1,100 @@
+x-livekit-credentials: &livekit-credentials
+  LIVEKIT_API_KEY: devkey
+  LIVEKIT_API_SECRET: devsecret-devsecret-devsecret-devsecret
+
+x-service-urls: &service-urls
+  DATABASE_URL: postgresql://weardit:weardit@postgres:5432/weardit
+  REDIS_URL: redis://redis:6379
+  EMBEDDER_URL: http://embedder:8001
+  FRAME_ARCHIVE_DIRECTORY: /data/frames
+
+services:
+  livekit:
+    image: livekit/livekit-server:v1.8
+    command: --config /etc/livekit.yaml --node-ip ${LIVEKIT_NODE_IP:?set LIVEKIT_NODE_IP in backend/.env}
+    volumes:
+      - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "50000-50100:50000-50100/udp"
+
+  redis:
+    image: redis:7
+    command: redis-server --loglevel warning
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    command: postgres -c log_min_messages=warning -c log_checkpoints=off
+    environment:
+      POSTGRES_USER: weardit
+      POSTGRES_PASSWORD: weardit
+      POSTGRES_DB: weardit
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: [*livekit-credentials, *service-urls]
+      LIVEKIT_API_URL: http://livekit:7880
+      LIVEKIT_PUBLIC_URL: ws://${LIVEKIT_NODE_IP}:7880
+    volumes:
+      - ./ingest/data/frames:/data/frames:ro
+    ports:
+      - "8000:8000"
+    depends_on: [livekit, postgres, embedder]
+
+  ingest:
+    build:
+      context: .
+      dockerfile: ingest/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: [*livekit-credentials, *service-urls]
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_LOG_LEVEL: error
+    volumes:
+      - ./ingest/data/frames:/data/frames
+    depends_on: [livekit, postgres, redis]
+
+  detector:
+    build:
+      context: .
+      dockerfile: detector/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *service-urls
+      MODEL_DIRECTORY: /models
+      SNAPSHOT_INTERVAL_S: ${SNAPSHOT_INTERVAL_S:-}
+      YOLO_VERBOSE: "False"
+      PYTHONWARNINGS: ignore
+    volumes:
+      - ./detector/model_cache:/models
+    depends_on: [redis]
+
+  embedder:
+    build:
+      context: .
+      dockerfile: embedder/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *service-urls
+      HF_HOME: /models
+      TRANSFORMERS_VERBOSITY: error
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      PYTHONWARNINGS: ignore
+    volumes:
+      - ./embedder/model_cache:/models
+    depends_on: [postgres, redis]
+
+volumes:
+  postgres_data:

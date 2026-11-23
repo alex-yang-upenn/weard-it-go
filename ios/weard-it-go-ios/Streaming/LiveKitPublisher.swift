@@ -7,28 +7,17 @@ import CoreVideo
 import Foundation
 import LiveKit
 
-/// Something the backend's model noticed, delivered over LiveKit RPC ("alert").
-nonisolated struct AlertEvent: Identifiable, Sendable, Decodable {
-    let id = UUID()
-    let title: String
-    let detail: String?
-    let receivedAt = Date()
-
-    private enum CodingKeys: String, CodingKey { case title, detail }
-}
-
-/// Publishes downsampled glasses video to a LiveKit room and receives alerts
-/// back from the backend agent.
+/// Publishes downsampled glasses video and GPS telemetry to a LiveKit room.
 ///
-/// The backend hands out credentials: `GET <backend>/token?identity=…` returns
-/// `{"url": "ws://…:7880", "token": "…", "room": "…"}`. LiveKit itself handles
-/// reconnects, bandwidth adaptation and NAT traversal.
+/// The backend's orchestrator hands out the room: `POST <backend>/sessions {"user_id": …}`
+/// returns `{"session_id": …, "livekit_url": "ws://…:7880", "token": …}`. The backend's
+/// ingest agent joins every room on its own. LiveKit handles reconnects, bandwidth
+/// adaptation and NAT traversal.
 nonisolated final class LiveKitPublisher: NSObject, @unchecked Sendable {
     enum Event: Sendable {
         case connectionState(LiveKit.ConnectionState)
         case published
         case framePublished
-        case alert(AlertEvent)
     }
 
     let events: AsyncStream<Event>
@@ -52,28 +41,28 @@ nonisolated final class LiveKitPublisher: NSObject, @unchecked Sendable {
 
     // MARK: - Connect / disconnect
 
-    private struct TokenResponse: Decodable {
-        let url: String
+    private struct CreateSessionRequest: Encodable {
+        let user_id: String
+    }
+
+    private struct CreateSessionResponse: Decodable {
+        let session_id: String
+        let livekit_url: String
         let token: String
     }
 
-    func connect(backendURL: URL, identity: String, settings: StreamSettings) async throws {
-        var components = URLComponents(url: backendURL.appending(path: "token"), resolvingAgainstBaseURL: false)
-        components?.queryItems = [URLQueryItem(name: "identity", value: identity)]
-        guard let tokenURL = components?.url else { throw URLError(.badURL) }
+    func connect(backendURL: URL, userID: String, settings: StreamSettings) async throws {
+        var request = URLRequest(url: backendURL.appending(path: "sessions"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(CreateSessionRequest(user_id: userID))
+        request.timeoutInterval = 10
 
-        let (data, response) = try await URLSession.shared.data(from: tokenURL)
+        let (data, response) = try await URLSession.shared.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-        let credentials = try JSONDecoder().decode(TokenResponse.self, from: data)
+        let session = try JSONDecoder().decode(CreateSessionResponse.self, from: data)
 
-        try await room.connect(url: credentials.url, token: credentials.token)
-
-        try await room.registerRpcMethod("alert") { [continuation] invocation in
-            if let event = try? JSONDecoder().decode(AlertEvent.self, from: Data(invocation.payload.utf8)) {
-                continuation.yield(.alert(event))
-            }
-            return "ok"
-        }
+        try await room.connect(url: session.livekit_url, token: session.token)
 
         let fps = Int(settings.outputFrameRate.rounded(.up))
         let newTrack = await LocalVideoTrack.createBufferTrack(
@@ -94,6 +83,16 @@ nonisolated final class LiveKitPublisher: NSObject, @unchecked Sendable {
             publishStarted = false
         }
         await room.disconnect()
+    }
+
+    // MARK: - Telemetry
+
+    /// Sends one JSON telemetry sample (e.g. GPS) on the data topic the backend's ingest listens to.
+    func sendTelemetry(_ telemetryJSON: Data) async throws {
+        try await room.localParticipant.publish(
+            data: telemetryJSON,
+            options: DataPublishOptions(topic: "telemetry", reliable: true)
+        )
     }
 
     // MARK: - Frames

@@ -24,7 +24,6 @@ struct ContentView: View {
                 locationSection
                 if controller.isRegistered {
                     streamSection
-                    alertsSection
                     previewSection
                 }
             }
@@ -50,6 +49,11 @@ struct ContentView: View {
                 }
             }
             #endif
+            .onChange(of: locationTracker.location) { _, location in
+                if let location {
+                    controller.shareLocation(location)
+                }
+            }
             .sheet(isPresented: $showSettings) {
                 SettingsView(isStreaming: controller.isRunning)
             }
@@ -119,6 +123,7 @@ struct ContentView: View {
             LabeledContent("Glasses → phone", value: String(format: "%.0f fps", controller.stats.glassesFPS))
             LabeledContent("Phone → LiveKit", value: String(format: "%.0f fps", controller.stats.publishFPS))
             LabeledContent("Frames published", value: "\(controller.stats.framesPublished)")
+            LabeledContent("User ID", value: UserIdentity.userID)
         }
     }
 
@@ -129,51 +134,9 @@ struct ContentView: View {
                 LabeledContent("Coordinates", value: String(format: "%.6f, %.6f", loc.coordinate.latitude, loc.coordinate.longitude))
                 LabeledContent("Accuracy", value: String(format: "±%.0f m", loc.horizontalAccuracy))
             }
-            if locationTracker.isRunning {
-                LabeledContent("Sent to backend") {
-                    VStack(alignment: .trailing) {
-                        if let sentAt = locationTracker.lastSentAt {
-                            Text("\(locationTracker.sentCount) · last \(sentAt.formatted(date: .omitted, time: .standard))")
-                        } else {
-                            Text("Not yet")
-                        }
-                        if let error = locationTracker.sendError {
-                            Text(error).font(.caption).foregroundStyle(.red)
-                        }
-                    }
-                }
-            }
+            LabeledContent("Sent while streaming", value: "\(controller.telemetrySentCount)")
             Button(locationTracker.isRunning ? "Stop Location" : "Start Location") {
                 locationTracker.isRunning ? locationTracker.stop() : locationTracker.start()
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var alertsSection: some View {
-        if !controller.alerts.isEmpty {
-            Section {
-                ForEach(controller.alerts) { alert in
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack {
-                            Text(alert.title).font(.headline)
-                            Spacer()
-                            Text(alert.receivedAt, style: .time)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        if let detail = alert.detail, !detail.isEmpty {
-                            Text(detail).font(.subheadline).foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            } header: {
-                HStack {
-                    Text("Alerts from backend")
-                    Spacer()
-                    Button("Clear") { controller.clearAlerts() }
-                        .font(.caption)
-                }
             }
         }
     }
@@ -223,14 +186,14 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("http://192.168.1.20:8765", text: $backendURL)
+                    TextField("http://192.168.1.20:8000", text: $backendURL)
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 } header: {
                     Text("Backend")
                 } footer: {
-                    Text("Where backend/live_agent.py runs. It hands the app a LiveKit token and sends alerts back.")
+                    Text("The backend orchestrator (port 8000). It creates a LiveKit session for each stream.")
                 }
 
                 Section {

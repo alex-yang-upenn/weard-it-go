@@ -1,0 +1,7 @@
+torch
+ultralytics>=8.4
+clip @ git+https://github.com/ultralytics/CLIP.git
+redis>=5
+numpy>=2.0
+pillow>=10.0
+zstandard>=0.23
